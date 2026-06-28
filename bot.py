@@ -1,95 +1,97 @@
 """
-FX Elite Desk — Automated Forex Factory News Bot
-Fetches economic calendar from Forex Factory RSS feed,
-generates a news image, and posts to Telegram channel.
+FX Elite Desk — Automated Forex Factory News Bot (Fixed Version)
+Uses PIL for image generation instead of Playwright
 """
 
 import os
 import asyncio
 import logging
-import feedparser
 import aiohttp
 import json
-import re
 from datetime import datetime, timezone
-from pathlib import Path
-from html import unescape
-from playwright.async_api import async_playwright
+from io import BytesIO
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]       # set in .env
-CHANNEL_ID  = os.environ["TELEGRAM_CHANNEL_ID"]      # e.g. @FX_ELITE_DESK_XAU
-GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")   # optional AI rewrite
+# PIL for image generation
+from PIL import Image, ImageDraw, ImageFont
 
-FF_RSS_URL  = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-# Forex Factory publishes their calendar as open JSON — no scraping needed.
+BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+CHANNEL_ID  = os.environ["TELEGRAM_CHANNEL_ID"]
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
 
-IMPACT_MAP  = {"High": "🔴", "Medium": "🟡", "Low": "🟢", "Holiday": "⚪"}
-HASHTAGS    = "#Forex #XAUUSDSignals #ForexNews #GoldTrading #TradingSignals"
+FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+IMPACT_MAP = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
+HASHTAGS   = "#Forex #XAUUSDSignals #ForexNews #GoldTrading #TradingSignals"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+
 # ─── FETCH NEWS ──────────────────────────────────────────────────────────────
-async def fetch_ff_events() -> list[dict]:
-    """Pull today's High/Medium impact events from Forex Factory calendar JSON."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(FF_RSS_URL, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            data = await r.json(content_type=None)
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    events = []
-    for ev in data:
-        try:
-            ev_date = ev.get("date", "")[:10]  # "2026-06-28T..."
-            impact  = ev.get("impact", "")
-            if ev_date == today and impact in ("High", "Medium"):
-                events.append({
-                    "title":    ev.get("title", ""),
-                    "country":  ev.get("country", ""),
-                    "impact":   impact,
-                    "icon":     IMPACT_MAP.get(impact, "⚪"),
-                    "date":     ev.get("date", ""),
-                    "forecast": ev.get("forecast", "—"),
-                    "previous": ev.get("previous", "—"),
-                })
-        except Exception:
-            continue
-    return events
-
-
-# ─── AI REWRITE (optional Gemini) ────────────────────────────────────────────
-async def rewrite_with_gemini(events: list[dict]) -> str:
-    """Use Gemini free tier to rephrase the news in channel's own voice."""
-    if not GEMINI_KEY:
-        return ""
-    prompt = (
-        "You are the voice of FX Elite Desk, a professional forex signal channel. "
-        "Rewrite the following economic calendar events into ONE short, engaging "
-        "Telegram post (max 200 words). Do NOT copy exact wording. Use emojis naturally. "
-        "End with a brief trading tip for gold (XAU/USD). Events:\n\n"
-        + json.dumps(events, indent=2)
-    )
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-1.5-flash-latest:generateContent?key=" + GEMINI_KEY
-    )
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    async with aiohttp.ClientSession() as s:
-        async with s.post(url, json=payload) as r:
-            resp = await r.json()
+async def fetch_ff_events() -> list:
     try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; FXEliteBot/1.0)"}
+            async with session.get(FF_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                text = await r.text()
+                data = json.loads(text)
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        events = []
+        for ev in data:
+            try:
+                ev_date = ev.get("date", "")[:10]
+                impact  = ev.get("impact", "")
+                if ev_date == today and impact in ("High", "Medium"):
+                    events.append({
+                        "title":    ev.get("title", "N/A"),
+                        "country":  ev.get("country", ""),
+                        "impact":   impact,
+                        "icon":     IMPACT_MAP.get(impact, "⚪"),
+                        "date":     ev.get("date", ""),
+                        "forecast": ev.get("forecast") or "—",
+                        "previous": ev.get("previous") or "—",
+                    })
+            except Exception as e:
+                log.warning("Skipping event: %s", e)
+                continue
+        return events
+    except Exception as e:
+        log.error("Failed to fetch events: %s", e)
+        return []
+
+
+# ─── AI REWRITE ──────────────────────────────────────────────────────────────
+async def rewrite_with_gemini(events: list) -> str:
+    if not GEMINI_KEY or not events:
+        return ""
+    try:
+        prompt = (
+            "You are FX Elite Desk, a professional forex signal channel. "
+            "Write a short engaging Telegram post (max 100 words) about these economic events. "
+            "Use emojis. End with a brief XAU/USD tip. Events:\n\n"
+            + json.dumps(events[:5], indent=2)
+        )
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-1.5-flash-latest:generateContent?key=" + GEMINI_KEY
+        )
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                resp = await r.json()
         return resp["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
+    except Exception as e:
+        log.warning("Gemini failed: %s", e)
         return ""
 
 
-# ─── BUILD MESSAGE TEXT ───────────────────────────────────────────────────────
-def build_message(events: list[dict], ai_text: str) -> str:
+# ─── BUILD MESSAGE ────────────────────────────────────────────────────────────
+def build_message(events: list, ai_text: str) -> str:
     now_str = datetime.now(timezone.utc).strftime("%d %b %Y")
     lines = [
         f"📰 *FOREX ECONOMIC NEWS — {now_str}*",
-        f"━━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
@@ -100,360 +102,187 @@ def build_message(events: list[dict], ai_text: str) -> str:
         lines.append("📋 *Today's Key Events:*")
         lines.append("")
 
-    for ev in events:
-        time_str = ""
-        try:
-            dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
-            time_str = dt.strftime("%I:%M %p UTC")
-        except Exception:
-            pass
-
-        lines += [
-            f"{ev['icon']} *{ev['title']}*",
-            f"   🌍 Country: {ev['country']}",
-            f"   ⏰ Time: {time_str}",
-            f"   📊 Forecast: {ev['forecast']}  |  Previous: {ev['previous']}",
-            "",
-        ]
-
-    if not events:
-        lines.append("✅ No high-impact news today. Markets may be quiet — trade safe!")
+    if events:
+        for ev in events:
+            time_str = ""
+            try:
+                dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+                time_str = dt.strftime("%I:%M %p UTC")
+            except Exception:
+                pass
+            lines += [
+                f"{ev['icon']} *{ev['title']}*",
+                f"   🌍 {ev['country']} | ⏰ {time_str}",
+                f"   📊 Forecast: {ev['forecast']}  |  Prev: {ev['previous']}",
+                "",
+            ]
+    else:
+        lines.append("✅ No major news today — markets may be quiet. Trade safe!")
         lines.append("")
 
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━",
         "⚡ *FX Elite Desk — Free XAU/USD Signals*",
-        "👉 Join: t.me/FX\\_ELITE\\_DESK\\_XAU",
+        "👉 t\\.me/forex\\_factory\\_news\\_daily",
         "",
         HASHTAGS,
     ]
     return "\n".join(lines)
 
 
-# ─── GENERATE IMAGE ──────────────────────────────────────────────────────────
-def build_html(events: list[dict]) -> str:
+# ─── GENERATE IMAGE WITH PIL ─────────────────────────────────────────────────
+def generate_image(events: list) -> BytesIO:
+    W, H = 900, 500 + max(0, len(events) - 3) * 60
+
+    # Colors
+    BG      = (10, 12, 16)
+    GOLD    = (201, 150, 42)
+    LGOLD   = (245, 214, 122)
+    WHITE   = (230, 224, 200)
+    GRAY    = (100, 95, 75)
+    RED     = (200, 20, 10)
+    YELLOW  = (210, 160, 20)
+    DARK    = (14, 16, 21)
+
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Gold accent bar top
+    draw.rectangle([(0, 0), (W, 4)], fill=GOLD)
+
+    # Header background
+    draw.rectangle([(0, 4), (W, 80)], fill=DARK)
+
+    # Brand name
+    try:
+        font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+        font_bold  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
+    except Exception:
+        font_big = font_med = font_small = font_bold = ImageFont.load_default()
+
+    draw.text((28, 18), "⚡ FX ELITE DESK", font=font_big, fill=LGOLD)
+    draw.text((28, 50), "FREE XAU/USD SIGNALS  •  t.me/forex_factory_news_daily", font=font_small, fill=GRAY)
+
+    # Breaking news badge
+    draw.rectangle([(720, 18), (870, 48)], fill=RED)
+    draw.text((730, 26), "⚡ BREAKING", font=font_small, fill=WHITE)
+
+    # Date strip
+    draw.rectangle([(0, 80), (W, 110)], fill=(14, 15, 20))
     now_str = datetime.now(timezone.utc).strftime("%d %B %Y")
-    rows = ""
+    draw.text((28, 90), f"📅 {now_str}  •  ECONOMIC CALENDAR  •  FOREX FACTORY", font=font_small, fill=LGOLD)
+
+    # Table header
+    draw.rectangle([(0, 110), (W, 140)], fill=(18, 20, 26))
+    headers = ["CCY", "EVENT", "IMPACT", "TIME (UTC)", "FORECAST", "PREVIOUS"]
+    col_x   = [28, 100, 430, 560, 680, 790]
+    for i, h in enumerate(headers):
+        draw.text((col_x[i], 120), h, font=font_small, fill=GRAY)
+
+    # Divider
+    draw.line([(0, 140), (W, 140)], fill=(42, 37, 16), width=1)
+
+    # Rows
+    y = 148
     for ev in events[:8]:
+        row_h = 54
+        draw.rectangle([(0, y), (W, y + row_h - 2)], fill=(12, 14, 18))
+
         time_str = ""
         try:
             dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
             time_str = dt.strftime("%I:%M %p")
         except Exception:
             pass
-        impact_cls = "high" if ev["impact"] == "High" else "med"
-        rows += f"""
-        <tr>
-          <td class="flag">{ev['country']}</td>
-          <td class="title-cell">{ev['title']}</td>
-          <td><span class="badge {impact_cls}">{ev['icon']} {ev['impact']}</span></td>
-          <td class="num">{time_str}</td>
-          <td class="num">{ev['forecast']}</td>
-          <td class="num">{ev['previous']}</td>
-        </tr>"""
 
-    if not rows:
-        rows = "<tr><td colspan='6' style='text-align:center;padding:20px;color:#aaa;'>No major events today</td></tr>"
+        impact_color = RED if ev["impact"] == "High" else YELLOW
 
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&family=Barlow:wght@400;500&display=swap');
+        draw.text((col_x[0], y + 8), ev["country"][:3], font=font_bold, fill=GRAY)
+        draw.text((col_x[1], y + 8), ev["title"][:38], font=font_bold, fill=WHITE)
 
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
+        # Impact badge
+        badge_w = 80
+        draw.rectangle([(col_x[2], y + 6), (col_x[2] + badge_w, y + 30)],
+                        fill=(*impact_color[:3], 40) if len(impact_color) == 3 else impact_color,
+                        outline=impact_color)
+        draw.text((col_x[2] + 8, y + 10), f"{ev['icon']} {ev['impact']}", font=font_small, fill=impact_color)
 
-  body {{
-    width: 900px;
-    background: #0a0c10;
-    font-family: 'Barlow', sans-serif;
-    color: #e8e0cc;
-    overflow: hidden;
-  }}
+        draw.text((col_x[3], y + 8), time_str, font=font_med, fill=GRAY)
+        draw.text((col_x[4], y + 8), str(ev["forecast"])[:8], font=font_med, fill=GRAY)
+        draw.text((col_x[5], y + 8), str(ev["previous"])[:8], font=font_med, fill=GRAY)
 
-  .card {{
-    width: 900px;
-    background: linear-gradient(160deg, #0f1218 0%, #0a0c10 60%);
-    border: 1px solid #2a2510;
-    position: relative;
-    overflow: hidden;
-  }}
+        draw.line([(0, y + row_h - 2), (W, y + row_h - 2)], fill=(25, 26, 20), width=1)
+        y += row_h
 
-  /* Gold accent bar top */
-  .accent-bar {{
-    height: 4px;
-    background: linear-gradient(90deg, #c9962a, #f5d67a, #c9962a);
-  }}
+    if not events:
+        draw.text((28, 165), "✅ No major economic events today — markets may be quiet.", font=font_med, fill=GRAY)
+        y = 220
 
-  /* Header */
-  .header {{
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 20px 28px 16px;
-    border-bottom: 1px solid #1e1c14;
-  }}
-  .brand {{
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }}
-  .brand-icon {{
-    width: 44px; height: 44px;
-    background: linear-gradient(135deg, #c9962a, #f5d67a);
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 22px;
-  }}
-  .brand-text h1 {{
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 20px; font-weight: 700;
-    color: #f5d67a;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-  }}
-  .brand-text p {{
-    font-size: 11px;
-    color: #8a7f60;
-    letter-spacing: 0.5px;
-  }}
+    # Footer
+    footer_y = max(y + 10, H - 44)
+    draw.rectangle([(0, footer_y), (W, H)], fill=DARK)
+    draw.line([(0, footer_y), (W, footer_y)], fill=(42, 37, 16), width=1)
+    draw.text((28, footer_y + 12), "Data: Forex Factory  •  For educational purposes only", font=font_small, fill=GRAY)
+    draw.text((650, footer_y + 12), "t.me/forex_factory_news_daily", font=font_small, fill=GOLD)
 
-  .headline-badge {{
-    background: linear-gradient(135deg, #c9140a, #8b0000);
-    color: white;
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 13px; font-weight: 700;
-    letter-spacing: 2px;
-    padding: 6px 14px;
-    border-radius: 4px;
-    text-transform: uppercase;
-    animation: none;
-    border: 1px solid #e32;
-  }}
-
-  .date-strip {{
-    background: #0e1015;
-    padding: 10px 28px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    border-bottom: 1px solid #1e1c14;
-  }}
-  .date-strip span {{
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 15px;
-    color: #f5d67a;
-    letter-spacing: 1px;
-  }}
-  .date-strip .dot {{
-    width: 5px; height: 5px;
-    background: #c9962a;
-    border-radius: 50%;
-  }}
-
-  /* Table */
-  .table-wrap {{ padding: 16px 28px 20px; }}
-
-  table {{
-    width: 100%;
-    border-collapse: collapse;
-  }}
-  thead tr {{
-    border-bottom: 1px solid #2a2510;
-  }}
-  thead th {{
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 1.5px;
-    color: #8a7f60;
-    text-transform: uppercase;
-    padding: 0 0 10px;
-    text-align: left;
-  }}
-  thead th.num {{ text-align: right; }}
-
-  tbody tr {{
-    border-bottom: 1px solid #13140e;
-    transition: background 0.15s;
-  }}
-  tbody tr:last-child {{ border-bottom: none; }}
-
-  td {{
-    padding: 11px 0;
-    font-size: 13.5px;
-    vertical-align: middle;
-  }}
-  td.flag {{
-    font-size: 12px;
-    color: #8a7f60;
-    width: 52px;
-    font-family: 'Barlow Condensed', sans-serif;
-    letter-spacing: 0.5px;
-    font-weight: 600;
-  }}
-  td.title-cell {{
-    font-size: 13px;
-    font-weight: 500;
-    color: #ddd8c0;
-    padding-right: 16px;
-  }}
-  td.num {{
-    text-align: right;
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 13px;
-    color: #a09060;
-  }}
-
-  .badge {{
-    display: inline-block;
-    padding: 3px 9px;
-    border-radius: 4px;
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-  }}
-  .badge.high {{ background: rgba(200,20,10,0.18); color: #ff6b5b; border: 1px solid rgba(200,20,10,0.4); }}
-  .badge.med  {{ background: rgba(210,160,20,0.15); color: #f5c842; border: 1px solid rgba(210,160,20,0.3); }}
-
-  /* Footer */
-  .footer {{
-    background: #0e1015;
-    border-top: 1px solid #1e1c14;
-    padding: 12px 28px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }}
-  .footer-left {{
-    font-size: 11px;
-    color: #5a5240;
-  }}
-  .footer-right {{
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 13px;
-    color: #c9962a;
-    letter-spacing: 0.5px;
-  }}
-
-  /* Decorative glow */
-  .glow {{
-    position: absolute;
-    top: -60px; right: -60px;
-    width: 200px; height: 200px;
-    background: radial-gradient(circle, rgba(201,150,42,0.08) 0%, transparent 70%);
-    pointer-events: none;
-  }}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="glow"></div>
-  <div class="accent-bar"></div>
-
-  <div class="header">
-    <div class="brand">
-      <div class="brand-icon">⚡</div>
-      <div class="brand-text">
-        <h1>FX Elite Desk</h1>
-        <p>FREE XAU/USD SIGNALS • t.me/FX_ELITE_DESK_XAU</p>
-      </div>
-    </div>
-    <div class="headline-badge">⚡ BREAKING NEWS</div>
-  </div>
-
-  <div class="date-strip">
-    <span>📅 {now_str}</span>
-    <div class="dot"></div>
-    <span style="color:#8a7f60;">ECONOMIC CALENDAR</span>
-    <div class="dot"></div>
-    <span style="color:#8a7f60;">FOREX FACTORY</span>
-  </div>
-
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>CCY</th>
-          <th>Event</th>
-          <th>Impact</th>
-          <th class="num">Time (UTC)</th>
-          <th class="num">Forecast</th>
-          <th class="num">Previous</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="footer">
-    <span class="footer-left">Data sourced from Forex Factory • For educational purposes only</span>
-    <span class="footer-right">t.me/FX_ELITE_DESK_XAU</span>
-  </div>
-</div>
-</body>
-</html>"""
+    buf = BytesIO()
+    img.save(buf, format="PNG", quality=95)
+    buf.seek(0)
+    return buf
 
 
-async def render_image(html: str, out_path: str):
-    """Use Playwright headless Chromium to screenshot the HTML card."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page    = await browser.new_page(viewport={"width": 900, "height": 600})
-        await page.set_content(html, wait_until="networkidle")
-        # Clip to actual card height
-        card = await page.query_selector(".card")
-        bb   = await card.bounding_box()
-        await page.screenshot(
-            path=out_path,
-            clip={"x": bb["x"], "y": bb["y"],
-                  "width": bb["width"], "height": bb["height"]},
-        )
-        await browser.close()
-    log.info("Image saved: %s", out_path)
-
-
-# ─── SEND TO TELEGRAM ─────────────────────────────────────────────────────────
-async def send_to_telegram(image_path: str, caption: str):
+# ─── SEND TO TELEGRAM ────────────────────────────────────────────────────────
+async def send_to_telegram(image_buf: BytesIO, caption: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    with open(image_path, "rb") as f:
-        data = aiohttp.FormData()
-        data.add_field("chat_id", CHANNEL_ID)
-        data.add_field("caption", caption)
-        data.add_field("parse_mode", "Markdown")
-        data.add_field("photo", f, filename="news.png", content_type="image/png")
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, data=data) as r:
-                resp = await r.json()
-                if resp.get("ok"):
-                    log.info("✅ Posted to Telegram!")
-                else:
-                    log.error("Telegram error: %s", resp)
+    data = aiohttp.FormData()
+    data.add_field("chat_id", CHANNEL_ID)
+    data.add_field("caption", caption)
+    data.add_field("parse_mode", "MarkdownV2")
+    data.add_field("photo", image_buf, filename="fx_news.png", content_type="image/png")
+
+    async with aiohttp.ClientSession() as s:
+        async with s.post(url, data=data) as r:
+            resp = await r.json()
+            if resp.get("ok"):
+                log.info("✅ Posted to Telegram successfully!")
+            else:
+                log.error("❌ Telegram error: %s", resp)
+                # Try sending text only if image fails
+                await send_text_only(caption)
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+async def send_text_only(caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "text": caption,
+        "parse_mode": "MarkdownV2"
+    }
+    async with aiohttp.ClientSession() as s:
+        async with s.post(url, json=payload) as r:
+            resp = await r.json()
+            if resp.get("ok"):
+                log.info("✅ Text posted to Telegram!")
+            else:
+                log.error("❌ Text post failed: %s", resp)
+
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 async def run():
     log.info("🚀 Fetching Forex Factory events...")
     events = await fetch_ff_events()
     log.info("Found %d events today", len(events))
 
-    # AI rewrite (optional)
     ai_text = await rewrite_with_gemini(events)
-
-    # Build message
     caption = build_message(events, ai_text)
 
-    # Generate image
-    html      = build_html(events)
-    img_path  = "/tmp/fx_news.png"
-    await render_image(html, img_path)
+    log.info("🖼️ Generating image...")
+    image_buf = generate_image(events)
 
-    # Post to Telegram
-    await send_to_telegram(img_path, caption)
+    log.info("📤 Sending to Telegram...")
+    await send_to_telegram(image_buf, caption)
 
 
 if __name__ == "__main__":
